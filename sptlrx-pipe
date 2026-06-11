@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""
+Pipe sptlrx lyrics output to a file for use with
+GNOME Shell Executor extension or any status bar.
+
+Features:
+- Writes synchronized lyrics from sptlrx to a file
+- Detects pause/stop via Spotify API and clears the file
+- Auto-refreshes expired tokens
+- Auto-restarts sptlrx if it dies
+
+Usage: sptlrx-pipe [output_path]
+  Default output path: /tmp/sptlrx-lyrics
+"""
+
+import json
+import os
+import sys
+import signal
+import subprocess
+import threading
+import time
+import urllib.request
+import urllib.error
+
+OUTPUT_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/sptlrx-lyrics"
+AUTH_PATH = os.path.expanduser("~/.local/state/sptlrx/spotify-auth.json")
+
+# Shared state
+is_playing = True        # assume playing until proven otherwise
+current_track_id = None  # track ID to detect song changes
+lock = threading.Lock()
+
+
+def write_lyrics(text: bytes):
+    """Atomically write lyrics text to the output file."""
+    if not text:
+        with open(OUTPUT_PATH, "w") as f:
+            f.write("")
+        return
+    try:
+        tmp = OUTPUT_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(text)
+        os.replace(tmp, OUTPUT_PATH)
+    except OSError:
+        pass
+
+
+def clear_lyrics():
+    """Clear the lyrics file (called when paused/stopped)."""
+    write_lyrics(b"")
+
+
+def load_auth():
+    """Load Spotify auth data from sptlrx's auth file."""
+    if not os.path.exists(AUTH_PATH):
+        return None
+    with open(AUTH_PATH) as f:
+        return json.load(f)
+
+
+def save_auth(data):
+    """Save updated auth tokens back to disk."""
+    os.makedirs(os.path.dirname(AUTH_PATH), exist_ok=True)
+    with open(AUTH_PATH, "w") as f:
+        json.dump(data, f)
+
+
+def refresh_token_if_needed(auth):
+    """Refresh Spotify access token if expired. Returns (access_token, auth_data)."""
+    expires_at_str = auth.get("expires_at", "")
+    if expires_at_str:
+        try:
+            expires_at = time.monotonic()
+            # Parse ISO datetime
+            from datetime import datetime, timezone, timedelta
+            dt = datetime.fromisoformat(expires_at_str)
+            now = datetime.now(tz=dt.tzinfo or timezone.utc)
+            if now < dt - timedelta(seconds=60):
+                return auth.get("access_token"), auth  # Still valid with 60s buffer
+        except Exception:
+            pass  # Can't parse, try refreshing anyway
+
+    # Refresh
+    refresh_token = auth.get("refresh_token")
+    client_id = auth.get("client_id")
+    client_secret = auth.get("client_secret")
+    if not refresh_token or not client_id or not client_secret:
+        return None, auth
+
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            auth["access_token"] = result["access_token"]
+            if "refresh_token" in result:
+                auth["refresh_token"] = result["refresh_token"]
+            auth["expires_at"] = (
+                time.time() + result.get("expires_in", 3600) - 60
+            )
+            save_auth(auth)
+            return auth["access_token"], auth
+    except Exception as e:
+        print(f"[sptlrx-pipe] Token refresh failed: {e}", flush=True)
+        return auth.get("access_token"), auth
+
+
+def spotify_poll():
+    """Background thread: poll Spotify playback state every 2s.
+    Tracks song changes and clears lyrics so stale text doesn't linger
+    when switching to a song without lyrics."""
+    global is_playing, current_track_id
+
+    while True:
+        try:
+            auth = load_auth()
+            if not auth:
+                time.sleep(3)
+                continue
+
+            token, auth = refresh_token_if_needed(auth)
+            if not token:
+                time.sleep(3)
+                continue
+
+            req = urllib.request.Request(
+                "https://api.spotify.com/v1/me/player",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 204:
+                        # No active device / nothing playing
+                        with lock:
+                            if is_playing:
+                                is_playing = False
+                                current_track_id = None
+                                clear_lyrics()
+                                print("[sptlrx-pipe] Playback stopped (no content)", flush=True)
+                    else:
+                        data = json.loads(resp.read())
+                        playing = data.get("is_playing", False)
+                        new_track_id = (
+                            data.get("item", {}).get("id")
+                            if data.get("item")
+                            else None
+                        )
+
+                        with lock:
+                            # Detect track change — clear old lyrics immediately
+                            if new_track_id and new_track_id != current_track_id:
+                                current_track_id = new_track_id
+                                clear_lyrics()
+                                print("[sptlrx-pipe] Track changed → cleared", flush=True)
+
+                            was_playing = is_playing
+                            is_playing = playing
+
+                            if was_playing and not playing:
+                                clear_lyrics()
+                                print("[sptlrx-pipe] Paused → cleared", flush=True)
+                            elif not was_playing and playing:
+                                print("[sptlrx-pipe] Resumed", flush=True)
+
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    # Token expired, force refresh
+                    print("[sptlrx-pipe] Token rejected, will refresh...", flush=True)
+                    auth["expires_at"] = "1970-01-01T00:00:00+00:00"
+                    save_auth(auth)
+                elif e.code == 404:
+                    with lock:
+                        if is_playing:
+                            is_playing = False
+                            current_track_id = None
+                            clear_lyrics()
+                            print("[sptlrx-pipe] Playback stopped (404)", flush=True)
+                time.sleep(2)
+
+        except Exception as e:
+            print(f"[sptlrx-pipe] Poll error: {e}", flush=True)
+
+        time.sleep(2)
+
+
+def pipe_loop():
+    """Main loop: run sptlrx pipe and write lyrics to file."""
+    global is_playing
+
+    while True:
+        print("[sptlrx-pipe] Launching sptlrx pipe...", flush=True)
+        proc = subprocess.Popen(
+            ["sptlrx", "pipe"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        assert proc.stdout is not None
+        for line in iter(proc.stdout.readline, b""):
+            text = line.strip()
+            if not text:
+                continue
+            with lock:
+                playing = is_playing
+            if playing:
+                write_lyrics(text)
+
+        proc.wait()
+        print("[sptlrx-pipe] sptlrx exited, restarting in 5s...", flush=True)
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    # Clear output on start
+    write_lyrics(b"")
+
+    # Start background Spotify poller
+    poller = threading.Thread(target=spotify_poll, daemon=True)
+    poller.start()
+
+    # Run the main pipe loop
+    pipe_loop()
