@@ -107,9 +107,12 @@ def refresh_token_if_needed(auth):
             auth["access_token"] = result["access_token"]
             if "refresh_token" in result:
                 auth["refresh_token"] = result["refresh_token"]
-            auth["expires_at"] = (
-                time.time() + result.get("expires_in", 3600) - 60
+            from datetime import datetime, timezone, timedelta
+            expires_dt = datetime.now(tz=timezone.utc) + timedelta(
+                seconds=result.get("expires_in", 3600) - 60
             )
+            # sptlrx expects ISO-8601 string, NOT a Unix timestamp
+            auth["expires_at"] = expires_dt.astimezone().isoformat()
             save_auth(auth)
             return auth["access_token"], auth
     except Exception as e:
