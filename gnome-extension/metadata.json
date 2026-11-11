@@ -1,0 +1,7 @@
+{
+  "uuid": "sptlrx-lyrics@gnome-shell-extension",
+  "name": "sptlrx Lyrics",
+  "description": "Show the current line from /tmp/sptlrx-lyrics in the GNOME top bar.",
+  "shell-version": ["45", "46", "47"],
+  "version": 1
+}

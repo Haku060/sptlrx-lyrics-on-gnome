@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=sptlrx Pipe
-Comment=Pipe sptlrx lyrics to named pipe for status bar display
+Name=MPRIS Lyrics Pipe
+Comment=Write local MPRIS lyrics to a file for the GNOME top bar
 Exec=/home/haku/.local/bin/sptlrx-pipe /tmp/sptlrx-lyrics
 Icon=audio-x-generic
 Terminal=false
