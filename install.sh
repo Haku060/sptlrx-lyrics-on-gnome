@@ -2,7 +2,8 @@
 set -e
 
 # ==========================================
-#  sptlrx Lyrics Package — One-Click Install
+#  MPRIS Lyrics on GNOME — One-Click Install
+#  Repository: mpris-lyrics-on-gnome
 #  Local MPRIS edition (no Spotify account)
 # ==========================================
 
@@ -19,17 +20,18 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "==> Installing sptlrx lyrics package..."
+echo "==> Installing MPRIS lyrics for GNOME..."
 echo "    Binary dir:  $BIN_DIR"
 echo "    Pipe output: $PIPE_PATH"
 
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$AUTOSTART_DIR"
 
-# 1. Install sptlrx binary (atomic replace: it may be running right now)
-cp "$(dirname "$0")/sptlrx" "$BIN_DIR/.sptlrx.new"
-chmod +x "$BIN_DIR/.sptlrx.new"
-mv -f "$BIN_DIR/.sptlrx.new" "$BIN_DIR/sptlrx"
-echo "    [✓] sptlrx → $BIN_DIR/sptlrx"
+# 1. Remove the old compiled sptlrx binary from existing installations.
+#    The pipe and the GNOME extension no longer use it.
+if [ -f "$BIN_DIR/sptlrx" ]; then
+    rm -f "$BIN_DIR/sptlrx"
+    echo "    [✓] removed obsolete $BIN_DIR/sptlrx"
+fi
 
 # 2. Install pipe script (atomic replace as well)
 cp "$(dirname "$0")/sptlrx-pipe" "$BIN_DIR/.sptlrx-pipe.new"
@@ -58,7 +60,7 @@ else
     echo "    [!] gdbus not found — install glib2 (Debian/Ubuntu: libglib2.0-bin)"
 fi
 
-# 6. Point sptlrx at the local MPRIS interface and optionally pin a player
+# 6. Point the pipe at the local MPRIS interface and optionally pin a player
 CONF="$HOME/.config/sptlrx/config.yaml"
 mkdir -p "$(dirname "$CONF")"
 python3 - "$CONF" "$MPRIS_PLAYER" <<'PY'
@@ -199,7 +201,7 @@ if [ "$USE_SYSTEMD" -eq 1 ]; then
     mkdir -p "$UNIT_DIR"
     cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=sptlrx lyrics pipe (local MPRIS)
+Description=MPRIS lyrics pipe (local MPRIS)
 After=graphical-session.target
 PartOf=graphical-session.target
 

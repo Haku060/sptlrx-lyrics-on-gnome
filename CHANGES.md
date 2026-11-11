@@ -1,14 +1,22 @@
-# 改动说明：本地 MPRIS + 网易云歌词
+# 改动说明：本地 MPRIS + 在线歌词
 
-本文记录本仓库从「Spotify 开发者账号 + Spotify Web API」改造为
-「本地 MPRIS + 网易云 / LRCLIB 歌词」的实现细节。
+本文记录本仓库从「第三方音乐服务开发者账号 + Web API」改造为
+「本地 MPRIS + 在线歌词」的实现细节。
+
+## 仓库名
+
+- GitHub 仓库：`mpris-lyrics-on-gnome`
+- 来源：从 [`Haku060/sptlrx-lyrics-on-gnome`](https://github.com/Haku060/sptlrx-lyrics-on-gnome)
+  fork 后改造。
+- 原来的编译产物 `sptlrx` 已删除；管道脚本名、配置目录和 GNOME 扩展 UUID
+  仍保留 `sptlrx` 前缀，以兼容已有安装。
 
 ## 目标
 
-1. 不再依赖 Spotify 开发者账号、Client ID/Secret 或 `sptlrx login`。
+1. 不再依赖第三方音乐服务开发者账号、Client ID/Secret 或登录步骤。
 2. 播放信息全部来自本地 MPRIS（D-Bus）。
-3. 自动识别所有有效的 MPRIS 播放器，而不是固定 Spotify。
-4. 歌词来源不再局限于 LRCLIB：优先使用网易云音乐，LRCLIB 兜底。
+3. 自动识别所有有效的 MPRIS 播放器，而不是固定某一个播放器。
+4. 歌词来源不再局限于单一在线源：优先使用在线歌词源，备用源兜底。
 5. 在 GNOME 顶栏显示当前歌词，并在暂停、停止、切歌时正确更新。
 
 ## 整体结构
@@ -20,7 +28,7 @@ MPRIS 播放器
   │  PlaybackStatus / Metadata / Position / mpris:length
   ▼
 sptlrx-pipe（Python）
-  │  本地 .lrc → 网易云 eapi → LRCLIB
+  │  本地 .lrc → 在线歌词 eapi → 备用在线源
   ▼
 /tmp/sptlrx-lyrics
   ▼
@@ -28,7 +36,7 @@ GNOME Shell 顶栏扩展
   sptlrx-lyrics@gnome-shell-extension
 ```
 
-`sptlrx` 二进制仍然保留在仓库中，可作为可选 TUI 使用；状态栏管道已经不再调用它。
+原来的 `sptlrx` 编译二进制已从仓库删除；状态栏管道和 GNOME 扩展都不再调用它。
 
 ## 文件清单
 
@@ -47,9 +55,15 @@ GNOME Shell 顶栏扩展
 | `gnome-extension/metadata.json` | GNOME Shell 扩展元数据 |
 | `gnome-extension/extension.js` | 顶栏歌词扩展 |
 | `gnome-extension/stylesheet.css` | 顶栏标签样式 |
-| `data/TSCharacters.txt` | OpenCC 繁转简表，用于网易云匹配 |
+| `data/TSCharacters.txt` | OpenCC 繁转简表，用于在线歌词匹配 |
 | `THIRD_PARTY_NOTICES.md` | 第三方资源与许可证说明 |
 | `CHANGES.md` | 本文件 |
+
+### 删除
+
+| 文件 | 说明 |
+|------|------|
+| `sptlrx` | 旧的 Go 编译二进制；状态栏管道不再使用，安装时会从 `~/.local/bin` 清理 |
 
 ## `sptlrx-pipe` 实现
 
@@ -100,15 +114,14 @@ mpris:
 仍然可以手动固定播放器：
 
 ```sh
-MPRIS_PLAYER=spotify ./install.sh
-MPRIS_PLAYER=open-orpheus ./install.sh
+MPRIS_PLAYER=<player> ./install.sh
 ```
 
 固定后会写入：
 
 ```yaml
 mpris:
-  players: [spotify]
+  players: [<player>]
 ```
 
 ### 3. 歌词来源
@@ -116,15 +129,15 @@ mpris:
 默认顺序：
 
 ```text
-local,netease,lrclib
+local,<online>,<fallback>
 ```
 
 可以通过环境变量覆盖：
 
 ```sh
-SPTLRX_LYRICS_SOURCES=netease
-SPTLRX_LYRICS_SOURCES=netease,lrclib
-SPTLRX_LYRICS_SOURCES=local,netease,lrclib
+SPTLRX_LYRICS_SOURCES=<online>
+SPTLRX_LYRICS_SOURCES=<online>,<fallback>
+SPTLRX_LYRICS_SOURCES=local,<online>,<fallback>
 ```
 
 #### 3.1 本地 `.lrc`
@@ -138,14 +151,14 @@ local:
 
 启动时扫描目录内所有 `.lrc` 文件，按文件名中的歌手/歌名匹配。
 
-#### 3.2 网易云音乐
+#### 3.2 在线歌词源
 
-参考 Lyricify 开源实现（`WXRIW/Lyricify-Lyrics-Helper`）的公开 eapi 请求方式：
+参考开源歌词工具的公开 eapi 请求方式：
 
 - 搜索：
-  `https://interface.music.163.com/eapi/cloudsearch/pc`
+  `https://<online-lyrics-host>/eapi/cloudsearch/pc`
 - 歌词：
-  `https://interface3.music.163.com/eapi/song/lyric/v1`
+  `https://<online-lyrics-host>/eapi/song/lyric/v1`
 
 eapi 加密流程：
 
@@ -160,7 +173,7 @@ AES 实现优先使用 Python 的 `cryptography`，没有时回退到系统 `ope
 
 - 歌名：精确匹配、包含匹配。
 - 歌手：精确匹配、包含匹配。
-- 时长：结合 MPRIS 的 `mpris:length` 与网易云的 `duration`/`dt`。
+- 时长：结合 MPRIS 的 `mpris:length` 与在线歌词源的 `duration`/`dt`。
 - 繁简转换：`data/TSCharacters.txt` 将繁体歌名/歌手转为简体后再比较，
   例如 `張敬軒 酷愛` → `张敬轩 酷爱`。
 
@@ -227,13 +240,14 @@ sptlrx-lyrics@gnome-shell-extension
 
 `install.sh` 会：
 
-1. 原子替换 `sptlrx` 和 `sptlrx-pipe`，避免运行中替换出现 `Text file busy`。
-2. 安装 `data/TSCharacters.txt` 到 `$PREFIX/share/sptlrx/`。
-3. 安装并启用 GNOME 扩展。
-4. 写入 `~/.config/sptlrx/config.yaml`：
+1. 删除旧版本遗留的 `~/.local/bin/sptlrx` 编译二进制。
+2. 原子替换 `sptlrx-pipe`，避免运行中替换出现 `Text file busy`。
+3. 安装 `data/TSCharacters.txt` 到 `$PREFIX/share/sptlrx/`。
+4. 安装并启用 GNOME 扩展。
+5. 写入 `~/.config/sptlrx/config.yaml`：
    - `player: mpris`
    - `mpris.players: []`（除非指定 `MPRIS_PLAYER`）
-5. 写入并启动 systemd 用户服务：
+6. 写入并启动 systemd 用户服务：
 
 ```text
 ~/.config/systemd/user/sptlrx-pipe.service
@@ -243,7 +257,7 @@ sptlrx-lyrics@gnome-shell-extension
 
 ```ini
 [Unit]
-Description=sptlrx lyrics pipe (local MPRIS)
+Description=MPRIS lyrics pipe (local MPRIS)
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -259,7 +273,7 @@ WantedBy=default.target
 
 使用 systemd 的原因：
 
-- 以 `unconfined` 身份运行，可以读取 snap 版 Spotify 的 MPRIS。
+- 以 `unconfined` 身份运行，可以读取某些受 AppArmor 限制的 snap 播放器。
 - 自动重启。
 - 不依赖桌面会话里某个终端进程。
 
@@ -292,26 +306,25 @@ busctl --user list | grep -i mpris
 
 - 模拟 MPRIS 播放器：播放、暂停、恢复、切歌。
 - 多个 MPRIS 播放器：自动选择正在播放的那个。
-- 网易云 `open-orpheus` 正在播放时自动切换并获取歌词。
-- Spotify 暂停、网易云播放时不再错误显示 Spotify。
+- 本地播放器正在播放时自动切换并获取歌词。
+- 当前播放器暂停、另一个播放器播放时能正确切换。
 - 浏览器暂停时不会抢占正在播放的音乐。
-- 网易云歌词、LRCLIB 兜底、本地 `.lrc` 三条路径。
+- 在线歌词、备用在线源、本地 `.lrc` 三条路径。
 - 顶栏扩展实际显示歌词。
 
 ## 已知限制
 
-- 网易云使用免登录公开接口，接口行为可能随平台调整而变化。
+- 在线歌词源使用免登录公开接口，接口行为可能随平台调整而变化。
 - 部分歌曲受地区/版权限制，可能搜索到现场版、翻唱版或无歌词；
   匹配会结合歌名、歌手和时长尽量选择正确版本。
-- 暂未合并网易云翻译歌词（`tlyric`）。
+- 暂未合并在线歌词源的翻译歌词。
 - 浏览器如果单独播放媒体，也会被识别为有效 MPRIS 来源；这是「识别所有
   MPRIS」的预期行为。
 - GNOME 扩展面向 GNOME Shell 45 / 46 / 47。
 
 ## 第三方资源
 
-- 网易云 eapi 请求格式参考
-  [WXRIW/Lyricify-Lyrics-Helper](https://github.com/WXRIW/Lyricify-Lyrics-Helper)
-  （Apache-2.0）。
+- 在线歌词 eapi 请求格式参考 Lyricify 开源实现
+  （Apache-2.0，详见 `THIRD_PARTY_NOTICES.md`）。
 - 繁简转换数据来自
   [OpenCC](https://github.com/BYVoid/OpenCC)（Apache-2.0）。
