@@ -9,7 +9,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const LYRICS_FILE = '/tmp/sptlrx-lyrics';
 const MAX_LENGTH = 75;
-const REFRESH_SECONDS = 1;
+const REFRESH_MS = 100;
 
 const LyricsIndicator = GObject.registerClass(
 class LyricsIndicator extends PanelMenu.Button {
@@ -23,9 +23,9 @@ class LyricsIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
-        this._timeoutId = GLib.timeout_add_seconds(
+        this._timeoutId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
-            REFRESH_SECONDS,
+            REFRESH_MS,
             () => {
                 this._refresh();
                 return GLib.SOURCE_CONTINUE;
