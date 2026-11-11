@@ -50,7 +50,14 @@ MPRIS_OBJECT = "/org/mpris/MediaPlayer2"
 MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 
 POLL_INTERVAL = 1.0  # how often to read MPRIS state
-TICK_INTERVAL = 0.15  # how often to update the current lyric line
+TICK_INTERVAL = 0.1  # how often to update the current lyric line
+
+try:
+    LYRICS_OFFSET_MS = int(
+        os.environ.get("SPTLRX_LYRICS_OFFSET_MS", "0") or 0
+    )
+except ValueError:
+    LYRICS_OFFSET_MS = 0
 
 LYRICS_SOURCES = [
     item.strip()
@@ -944,6 +951,7 @@ def main():
     write_lyrics("")
     log("sptlrx-pipe started (local MPRIS)")
     log(f"Lyrics sources: {', '.join(LYRICS_SOURCES)}")
+    log(f"Lyrics offset: {LYRICS_OFFSET_MS:+d} ms")
 
     if not shutil.which("gdbus"):
         log("WARNING: gdbus not found; install glib2 (provides gdbus)")
@@ -977,7 +985,9 @@ def main():
         nonlocal line_index
         if not lines:
             return
-        index = find_line_index(line_times, current_position_ms())
+        index = find_line_index(
+            line_times, current_position_ms() + LYRICS_OFFSET_MS
+        )
         if index == line_index:
             return
         line_index = index
@@ -1069,7 +1079,8 @@ def main():
                             line_times = [item[0] for item in lines]
                             if lines:
                                 index = find_line_index(
-                                    line_times, position_base_ms
+                                    line_times,
+                                    position_base_ms + LYRICS_OFFSET_MS,
                                 )
                                 line_index = index
                                 if index >= 0 and status == "Playing":

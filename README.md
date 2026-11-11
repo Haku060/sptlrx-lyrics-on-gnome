@@ -129,6 +129,34 @@ local:
 歌曲匹配会先做繁转简，再结合歌名、歌手和 `mpris:length` 时长来选择
 最接近的在线歌词结果。
 
+## 同步微调
+
+歌词按本地 MPRIS 的播放位置同步。管道每 100 ms 计算一次当前行，顶栏扩展
+每 100 ms 读取一次输出文件。
+
+如果某些歌整体偏快或偏慢，可以加一个全局偏移：
+
+```sh
+# 正数：歌词提前（显示更早）
+SPTLRX_LYRICS_OFFSET_MS=100
+
+# 负数：歌词延后（显示更晚）
+SPTLRX_LYRICS_OFFSET_MS=-100
+```
+
+可以写进 systemd 服务：
+
+```ini
+Environment=SPTLRX_LYRICS_OFFSET_MS=100
+```
+
+然后重启：
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart sptlrx-pipe.service
+```
+
 ## 工作原理
 
 ```text
