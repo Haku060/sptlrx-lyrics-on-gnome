@@ -157,7 +157,31 @@ systemctl --user daemon-reload
 systemctl --user restart sptlrx-pipe.service
 ```
 
+## 切歌时短暂显示歌名
+
+切歌时会先短暂显示「歌手 - 歌名」，再切回同步歌词，方便确认当前曲目。展示时长默认 2 秒，可以用环境变量调整：
+
+```sh
+# 显示 4 秒
+SPTLRX_TRACK_CHANGE_INTRO_SECONDS=4 systemctl --user restart sptlrx-pipe.service
+```
+
+也可以写进 systemd 服务：
+
+```ini
+Environment=SPTLRX_TRACK_CHANGE_INTRO_SECONDS=4
+```
+
+设为 `0` 可关闭该效果，切歌后直接显示歌词。
+
 ## 工作原理
+
+播放过程中不会留白：
+
+- 有歌词的歌曲遇到间奏时（LRC 里是空歌词行），保持显示上一句歌词，
+  顶栏不会突然变空白。
+- 纯音乐或没找到歌词时，显示 `♪`（在播放、无歌词）。
+- 前奏尚未到第一句歌词时，也显示 `♪`。
 
 ```text
 播放器 --MPRIS/D-Bus--> sptlrx-pipe --当前歌词行--> /tmp/sptlrx-lyrics
@@ -169,7 +193,8 @@ systemctl --user restart sptlrx-pipe.service
 
 - 播放信息（歌名、歌手、进度、暂停状态）全部来自本地 MPRIS。
 - 自动检测所有 MPRIS 播放器：优先跟随正在播放的那个；在别的 App 里点播放
-  会自动切换过去，浏览器开始播放不会抢走正在播放的音乐。
+  会自动切换过去。只有音乐类播放器会影响歌词，浏览器（Chrome、
+  Firefox 等）任何时候都不会抢走或显示歌词。
 - 歌词按本地 `.lrc` → 在线歌词源 → 备用在线歌词源的顺序获取。
 - 在暂停/停止/切歌时清空或更新状态栏，避免显示上一首或暂停时的旧歌词。
 - 全程不使用第三方音乐服务的 Web API，不需要开发者账号、Client ID/Secret

@@ -51,6 +51,8 @@ MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 
 POLL_INTERVAL = 1.0  # how often to read MPRIS state
 TICK_INTERVAL = 0.1  # how often to update the current lyric line
+MPRIS_ABSENT_GRACE = 3  # polls a music player may be missing from
+                        # detection before we give it up and stop showing its lyrics
 
 try:
     LYRICS_OFFSET_MS = int(
@@ -58,6 +60,13 @@ try:
     )
 except ValueError:
     LYRICS_OFFSET_MS = 0
+
+try:
+    TRACK_CHANGE_INTRO_SECONDS = float(
+        os.environ.get("SPTLRX_TRACK_CHANGE_INTRO_SECONDS", "2") or "2"
+    )
+except ValueError:
+    TRACK_CHANGE_INTRO_SECONDS = 2.0
 
 LYRICS_SOURCES = [
     item.strip()
@@ -326,71 +335,66 @@ def scan_players(whitelist):
 
 def choose_player(states, current_player, newly_playing=None):
     """
-    Prefer the player that is actually Playing.
+    Only non-browser (music) players are ever eligible. A browser such as
+    Chrome, Firefox or Edge can never steal or take over the lyrics — only
+    whitelisted music players affect the display, at any time.
 
     Rules:
       - A music player that just started playing wins immediately, so
         pressing Play in NetEase/Spotify switches to that app.
-      - Otherwise keep the current player if it is playing (a browser
-        starting playback should not steal the lyrics).
-      - If the current player is paused/stopped and another player is
-        playing, switch to the playing one.
-      - If nothing is playing, keep the current player if it still exists.
-      - With no current player, fall back to the order reported by the
-        session bus (music players still win over browsers, per rule 4).
+      - Otherwise keep the current music player if it is playing.
+      - If the current music player is paused/stopped and another music
+        player is playing, switch to that music player.
+      - If nothing music is playing, keep the current music player if it
+        still exists (even if momentarily not detected this tick);
+        otherwise no player is selected. A browser is never selected.
     """
-    if not states:
+    newly_playing = newly_playing or set()
+
+    # Browsers are ignored entirely: they can never be the active player.
+    music = [item for item in states if not is_browser_player(item[0])]
+    if not music:
         return None
 
-    newly_playing = newly_playing or set()
     by_bus = dict(states)
+    order = {bus: index for index, (bus, _state) in enumerate(music)}
+
+    def best(candidates):
+        return min(candidates, key=lambda item: order.get(item[0], len(music)))[0]
+
+    current_is_music = bool(
+        current_player and not is_browser_player(current_player)
+    )
+    current_detected = current_player in by_bus
     current_state = by_bus.get(current_player)
     current_playing = bool(
-        current_state and current_state.get("status") == "Playing"
+        current_detected and current_state.get("status") == "Playing"
     )
 
     playing = [
-        (bus, state)
-        for bus, state in states
-        if state.get("status") == "Playing"
+        item for item in music if item[1].get("status") == "Playing"
     ]
 
-    order = {bus: index for index, (bus, _state) in enumerate(states)}
-
-    def best(candidates):
-        return min(
-            candidates,
-            key=lambda item: (
-                is_browser_player(item[0]),
-                order.get(item[0], len(states)),
-            ),
-        )[0]
-
-    new_music = [
-        item
-        for item in playing
-        if item[0] in newly_playing
-        and not is_browser_player(item[0])
-    ]
+    # A newly-started music player wins immediately.
+    new_music = [item for item in playing if item[0] in newly_playing]
     if new_music:
         return best(new_music)
 
+    # Keep the current music player while it is playing.
     if current_playing:
-        if is_browser_player(current_player):
-            music = [
-                item for item in playing if not is_browser_player(item[0])
-            ]
-            if music:
-                return best(music)
         return current_player
 
+    # A (different) music player that is playing wins over a paused one.
     if playing:
         return best(playing)
 
-    if current_state is not None:
+    # Nothing music is playing: keep the current music player if it still
+    # exists, so a paused music player is never dropped in favor of a
+    # browser.
+    if current_detected and current_is_music:
         return current_player
 
-    return best(states)
+    return None
 
 
 # GVariant text output uses single quotes for strings, but switches to
@@ -973,6 +977,9 @@ def main():
     next_poll = 0.0
     known_buses = set()
     previous_playing = set()
+    intro_label = ""
+    intro_until = 0.0
+    absent_ticks = 0
 
     def current_position_ms():
         if not is_playing:
@@ -983,27 +990,52 @@ def main():
 
     def show_current_line():
         nonlocal line_index
-        if not lines:
+        now = time.monotonic()
+
+        # Briefly show artist - title right after a track change.
+        if intro_label and now < intro_until:
+            set_output(intro_label)
             return
+
+        if not lines:
+            # No synced lyrics for this track (e.g. pure instrumental): ♪.
+            set_output("\u266b")
+            return
+
         index = find_line_index(
             line_times, current_position_ms() + LYRICS_OFFSET_MS
         )
         if index == line_index:
             return
         line_index = index
-        if index >= 0:
-            set_output(lines[index][1])
-        else:
-            set_output("")
+        if index < 0:
+            # Before the first verse: no lyric line yet.
+            set_output("\u266b")
+            return
+        text = lines[index][1]
+        if text:
+            set_output(text)
+        # Empty text == instrumental marker (间奏): keep the shown line,
+        # so the top bar never blanks out mid-song.
 
     while True:
         now = time.monotonic()
 
         if now >= next_poll:
             states = scan_players(whitelist)
-            buses = set(bus for bus, _ in states)
-            if buses != known_buses:
-                known_buses = buses
+            buses_present = set(bus for bus, _ in states)
+
+            # Count how long the current non-browser player has been absent
+            # from detection. A transient D-Bus hiccup or a failed state read
+            # shouldn't let a browser steal control, but a genuinely closed
+            # player is eventually dropped after the grace period.
+            if current_player and current_player not in buses_present:
+                absent_ticks += 1
+            else:
+                absent_ticks = 0
+
+            if buses_present != known_buses:
+                known_buses = buses_present
                 if states:
                     summary = ", ".join(
                         f"{player_suffix(bus)}={state.get('status')}"
@@ -1022,6 +1054,18 @@ def main():
             previous_playing = playing_now
 
             chosen = choose_player(states, current_player, newly_playing)
+
+            # Hold onto a music player across brief detection gaps so a
+            # transient D-Bus hiccup doesn't blank the bar; only after it
+            # has been absent for several polls do we give it up.
+            if current_player and not is_browser_player(current_player):
+                if absent_ticks >= MPRIS_ABSENT_GRACE:
+                    chosen = choose_player(
+                        states, None, newly_playing
+                    )
+                elif not chosen:
+                    chosen = current_player
+
             by_bus = dict(states)
 
             if chosen != current_player:
@@ -1068,23 +1112,21 @@ def main():
 
                         if state.get("title"):
                             log(f"Track changed: {state.get('label')}")
+                            # Briefly show artist - title before lyrics.
                             if status == "Playing":
-                                set_output("\u266b")
-                            lines = fetch_lyrics(
-                                state.get("artist", ""),
-                                state.get("title", ""),
-                                state.get("length_ms"),
-                                local_index,
-                            )
-                            line_times = [item[0] for item in lines]
-                            if lines:
-                                index = find_line_index(
-                                    line_times,
-                                    position_base_ms + LYRICS_OFFSET_MS,
+                                intro_label = state.get("label")
+                                intro_until = (
+                                    time.monotonic()
+                                    + TRACK_CHANGE_INTRO_SECONDS
                                 )
-                                line_index = index
-                                if index >= 0 and status == "Playing":
-                                    set_output(lines[index][1])
+
+                        lines = fetch_lyrics(
+                            state.get("artist", ""),
+                            state.get("title", ""),
+                            state.get("length_ms"),
+                            local_index,
+                        )
+                        line_times = [item[0] for item in lines]
                     else:
                         if state.get("position_ms") is not None:
                             position_base_ms = state["position_ms"]
@@ -1093,10 +1135,7 @@ def main():
                     if status == "Playing":
                         if not was_playing:
                             log(f"Playing: {state.get('label')}")
-                            if lines:
-                                show_current_line()
-                            else:
-                                set_output("\u266b")
+                            show_current_line()
                         is_playing = True
                     else:
                         is_playing = False
@@ -1110,7 +1149,7 @@ def main():
 
             next_poll = now + POLL_INTERVAL
 
-        if is_playing and lines:
+        if is_playing:
             show_current_line()
 
         time.sleep(TICK_INTERVAL)
