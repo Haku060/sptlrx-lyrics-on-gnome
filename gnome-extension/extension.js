@@ -64,7 +64,7 @@ class LyricsIndicator extends PanelMenu.Button {
 export default class SptlrxLyricsExtension extends Extension {
     enable() {
         this._indicator = new LyricsIndicator();
-        Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'right');
+        Main.panel.addToStatusArea(this.uuid, this._indicator, 100, 'left');
     }
 
     disable() {
