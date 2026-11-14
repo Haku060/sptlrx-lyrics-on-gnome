@@ -1,7 +1,8 @@
 {
-  "uuid": "sptlrx-lyrics@gnome-shell-extension",
-  "name": "sptlrx Lyrics",
-  "description": "Show the current line from /tmp/sptlrx-lyrics in the GNOME top bar.",
+  "uuid": "mpris-lyrics@gnome-shell-extension",
+  "name": "MPRIS Lyrics",
+  "description": "Show the current lyric line from a local MPRIS lyrics pipe in the GNOME top panel.",
   "shell-version": ["45", "46", "47"],
-  "version": 1
+  "settings-schema": "org.gnome.shell.extensions.mpris-lyrics",
+  "version": 2
 }

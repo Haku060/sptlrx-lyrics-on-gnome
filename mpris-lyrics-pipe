@@ -4,20 +4,21 @@ Pipe time-synced lyrics to a file for use with GNOME Shell Executor
 or the bundled GNOME top-bar extension.
 
 Playback information is read directly from the local MPRIS D-Bus
-interface, so no Spotify developer account, Client ID/Secret, or
-login token is required.
+interface, so no account-based service login is required.
 
-Lyrics sources (in order):
-  1. local .lrc folder from sptlrx's config (`local.folder`)
-  2. NetEase Cloud Music (same public eapi endpoints used by Lyricify)
-  3. LRCLIB (https://lrclib.net)
+Lyrics sources:
+  1. local .lrc folder from mpris-lyrics config (`local.folder`)
+  2. online lyrics source
+  3. fallback online lyrics source
+
+Candidates are scored and the highest total wins.
 
 Single-threaded: no deadlocks, no GIL issues.
 
-Usage: sptlrx-pipe [output_path]
-  Default output path: /tmp/sptlrx-lyrics
+Usage: mpris-lyrics-pipe [output_path]
+  Default output path: /tmp/mpris-lyrics
 
-Logs: /tmp/sptlrx-lyrics.log
+Logs: /tmp/mpris-lyrics.log
 """
 
 import atexit
@@ -38,12 +39,26 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-OUTPUT_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/sptlrx-lyrics"
+def env_first(*names, default=""):
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+OUTPUT_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mpris-lyrics"
 LOG_PATH = os.path.splitext(OUTPUT_PATH)[0] + ".log"
 PID_PATH = OUTPUT_PATH + ".pid"
-CONFIG_PATH = os.environ.get(
-    "SPTLRX_CONFIG", os.path.expanduser("~/.config/sptlrx/config.yaml")
-)
+
+_DEFAULT_CONFIG = os.path.expanduser("~/.config/mpris-lyrics/config.yaml")
+_LEGACY_CONFIG = os.path.expanduser("~/.config/sptlrx/config.yaml")
+CONFIG_PATH = env_first("MPRIS_LYRICS_CONFIG", "SPTLRX_CONFIG")
+if not CONFIG_PATH:
+    if os.path.exists(_DEFAULT_CONFIG) or not os.path.exists(_LEGACY_CONFIG):
+        CONFIG_PATH = _DEFAULT_CONFIG
+    else:
+        CONFIG_PATH = _LEGACY_CONFIG
 
 MPRIS_PREFIX = "org.mpris.MediaPlayer2."
 MPRIS_OBJECT = "/org/mpris/MediaPlayer2"
@@ -51,30 +66,52 @@ MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 
 POLL_INTERVAL = 1.0  # how often to read MPRIS state
 TICK_INTERVAL = 0.1  # how often to update the current lyric line
-MPRIS_ABSENT_GRACE = 3  # polls a music player may be missing from
-                        # detection before we give it up and stop showing its lyrics
 
 try:
     LYRICS_OFFSET_MS = int(
-        os.environ.get("SPTLRX_LYRICS_OFFSET_MS", "0") or 0
+        env_first(
+            "MPRIS_LYRICS_OFFSET_MS",
+            "SPTLRX_LYRICS_OFFSET_MS",
+            default="0",
+        )
+        or 0
     )
 except ValueError:
     LYRICS_OFFSET_MS = 0
 
-try:
-    TRACK_CHANGE_INTRO_SECONDS = float(
-        os.environ.get("SPTLRX_TRACK_CHANGE_INTRO_SECONDS", "2") or "2"
-    )
-except ValueError:
-    TRACK_CHANGE_INTRO_SECONDS = 2.0
-
 LYRICS_SOURCES = [
     item.strip()
-    for item in os.environ.get(
-        "SPTLRX_LYRICS_SOURCES", "local,netease,lrclib"
+    for item in env_first(
+        "MPRIS_LYRICS_SOURCES",
+        "SPTLRX_LYRICS_SOURCES",
+        default="local,netease,lrclib",
     ).split(",")
     if item.strip()
 ]
+
+
+def detect_chinese_script():
+    value = env_first(
+        "MPRIS_LYRICS_CHINESE_SCRIPT",
+        "SPTLRX_CHINESE_SCRIPT",
+        default="auto",
+    ).strip().lower()
+    if value in ("simplified", "traditional", "original"):
+        return value
+    locale_name = (
+        os.environ.get("LC_ALL")
+        or os.environ.get("LC_CTYPE")
+        or os.environ.get("LANG")
+        or ""
+    ).lower()
+    if locale_name.startswith(("zh_cn", "zh_sg")):
+        return "simplified"
+    if locale_name.startswith(("zh_tw", "zh_hk", "zh_mo")):
+        return "traditional"
+    return "original"
+
+
+CHINESE_SCRIPT = detect_chinese_script()
 
 # --- NetEase Cloud Music public endpoints (same family as Lyricify's) ---
 NETEASE_SEARCH_URL = "https://interface.music.163.com/eapi/cloudsearch/pc"
@@ -86,7 +123,7 @@ NETEASE_UA = (
 )
 NETEASE_EAPI_KEY = b"e82ckenh8dichen8"
 
-LRCLIB_UA = "sptlrx-lyrics-pipe/1.0 (local MPRIS lyrics bridge)"
+LRCLIB_UA = "mpris-lyrics-pipe/1.0 (local MPRIS lyrics bridge)"
 
 # State
 is_playing = False
@@ -123,7 +160,7 @@ def remove_pidfile():
 
 
 def another_instance_running():
-    """Return True if the PID file points to a live sptlrx-pipe."""
+    """Return True if the PID file points to a live mpris-lyrics-pipe."""
     try:
         with open(PID_PATH) as f:
             pid = int(f.read().strip())
@@ -140,7 +177,7 @@ def another_instance_running():
             cmdline = f.read().replace(b"\0", b" ").decode(
                 "utf-8", "replace"
             )
-        return "sptlrx-pipe" in cmdline
+        return "mpris-lyrics-pipe" in cmdline or "sptlrx-pipe" in cmdline
     except OSError:
         return True
 
@@ -205,7 +242,7 @@ def list_mpris_players():
 
 
 def read_mpris_whitelist(path):
-    """Minimal reader for the `mpris.players` option in sptlrx's config."""
+    """Minimal reader for the `mpris.players` option in mpris-lyrics config."""
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -259,7 +296,7 @@ def read_mpris_whitelist(path):
 
 
 def read_config_scalar(path, section, key):
-    """Read a simple `section:\n  key: value` string from sptlrx's YAML."""
+    """Read a simple `section:\n  key: value` string from mpris-lyrics YAML."""
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -335,66 +372,56 @@ def scan_players(whitelist):
 
 def choose_player(states, current_player, newly_playing=None):
     """
-    Only non-browser (music) players are ever eligible. A browser such as
-    Chrome, Firefox or Edge can never steal or take over the lyrics — only
-    whitelisted music players affect the display, at any time.
+    Only non-browser (music) players are eligible.
 
-    Rules:
-      - A music player that just started playing wins immediately, so
-        pressing Play in NetEase/Spotify switches to that app.
-      - Otherwise keep the current music player if it is playing.
-      - If the current music player is paused/stopped and another music
-        player is playing, switch to that music player.
-      - If nothing music is playing, keep the current music player if it
-        still exists (even if momentarily not detected this tick);
-        otherwise no player is selected. A browser is never selected.
+    A browser such as Chrome, Firefox or Edge can never become the active
+    lyrics player, even if it is the only MPRIS source currently playing.
     """
     newly_playing = newly_playing or set()
 
-    # Browsers are ignored entirely: they can never be the active player.
     music = [item for item in states if not is_browser_player(item[0])]
     if not music:
         return None
 
-    by_bus = dict(states)
+    by_bus = dict(music)
     order = {bus: index for index, (bus, _state) in enumerate(music)}
 
     def best(candidates):
-        return min(candidates, key=lambda item: order.get(item[0], len(music)))[0]
+        return min(
+            candidates,
+            key=lambda item: order.get(item[0], len(music)),
+        )[0]
 
-    current_is_music = bool(
-        current_player and not is_browser_player(current_player)
-    )
-    current_detected = current_player in by_bus
     current_state = by_bus.get(current_player)
+    current_detected = current_player in by_bus
     current_playing = bool(
         current_detected and current_state.get("status") == "Playing"
     )
 
     playing = [
-        item for item in music if item[1].get("status") == "Playing"
+        (bus, state)
+        for bus, state in music
+        if state.get("status") == "Playing"
     ]
 
-    # A newly-started music player wins immediately.
-    new_music = [item for item in playing if item[0] in newly_playing]
+    new_music = [
+        item for item in playing if item[0] in newly_playing
+    ]
     if new_music:
         return best(new_music)
 
-    # Keep the current music player while it is playing.
     if current_playing:
         return current_player
 
-    # A (different) music player that is playing wins over a paused one.
     if playing:
         return best(playing)
 
-    # Nothing music is playing: keep the current music player if it still
-    # exists, so a paused music player is never dropped in favor of a
-    # browser.
-    if current_detected and current_is_music:
+    if current_detected:
         return current_player
 
-    return None
+    # No current player and nothing playing: still show the first paused
+    # music player, so the panel says Paused/Stopped instead of No player.
+    return best(music)
 
 
 # GVariant text output uses single quotes for strings, but switches to
@@ -499,12 +526,17 @@ def load_t2s():
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, "data", "TSCharacters.txt"),
+        os.path.join(here, "..", "share", "mpris-lyrics", "TSCharacters.txt"),
+        os.path.expanduser("~/.local/share/mpris-lyrics/TSCharacters.txt"),
+        "/usr/local/share/mpris-lyrics/TSCharacters.txt",
+        "/usr/share/mpris-lyrics/TSCharacters.txt",
+        # Legacy fallback for an installation that has not been migrated yet.
         os.path.join(here, "..", "share", "sptlrx", "TSCharacters.txt"),
         os.path.expanduser("~/.local/share/sptlrx/TSCharacters.txt"),
         "/usr/local/share/sptlrx/TSCharacters.txt",
         "/usr/share/sptlrx/TSCharacters.txt",
     ]
-    data_dir = os.environ.get("SPTLRX_DATA_DIR")
+    data_dir = env_first("MPRIS_LYRICS_DATA_DIR", "SPTLRX_DATA_DIR")
     if data_dir:
         candidates.insert(0, os.path.join(data_dir, "TSCharacters.txt"))
     mapping = {}
@@ -531,6 +563,27 @@ def to_simplified(text):
     if not _T2S:
         return text or ""
     return "".join(_T2S.get(ch, ch) for ch in text)
+
+
+def apply_script_text(text):
+    text = unicodedata.normalize("NFKC", text or "")
+    if CHINESE_SCRIPT == "simplified":
+        text = to_simplified(text)
+    return text
+
+
+def apply_script_preference(lines):
+    if CHINESE_SCRIPT != "simplified":
+        return lines
+    return [
+        (timestamp, apply_script_text(text))
+        for timestamp, text in lines
+    ]
+
+
+def search_text(text):
+    """NFKC + traditional-to-simplified text for online search queries."""
+    return to_simplified(unicodedata.normalize("NFKC", text or ""))
 
 
 def normalize(text):
@@ -617,32 +670,93 @@ def build_local_index(folder):
     return index
 
 
-def find_local_lyrics(artist, title, index):
+SOURCE_BONUS = {"local": 10, "netease": 0, "lrclib": 0}
+
+
+def lyric_quality_score(lines, length_ms):
+    """Score how useful a timed lyric file is for the current track."""
+    if len(lines) < 2:
+        return 0
+
+    non_empty = [text for _, text in lines if text.strip()]
+    if len(non_empty) < 2:
+        return 0
+
+    # A 3-minute song with only 2-3 lines is almost certainly wrong or
+    # incomplete.
+    if length_ms and length_ms > 60000 and len(non_empty) < 4:
+        return 0
+
+    line_score = min(80, int(len(non_empty) * 1.5))
+
+    last_time = lines[-1][0]
+    if length_ms and length_ms > 0:
+        if last_time > length_ms + 15000:
+            coverage = 0
+        else:
+            ratio = min(1.0, last_time / length_ms)
+            if ratio >= 0.7:
+                coverage = 60
+            elif ratio >= 0.5:
+                coverage = 40
+            elif ratio >= 0.3:
+                coverage = 20
+            else:
+                coverage = 5
+    else:
+        coverage = 30
+
+    density = len(non_empty) / len(lines)
+    density_score = int(40 * density)
+    return line_score + coverage + density_score
+
+
+def build_candidate(source, lines, match_score, detail, length_ms):
+    quality = lyric_quality_score(lines, length_ms)
+    if quality < 30:
+        return None
+    return {
+        "source": source,
+        "lines": lines,
+        "match": match_score,
+        "quality": quality,
+        "total": match_score + quality + SOURCE_BONUS.get(source, 0),
+        "detail": detail,
+    }
+
+
+def find_local_candidate(artist, title, index, length_ms):
     if not index:
-        return []
+        return None
+
     query = set(normalize(f"{artist} {title}").split())
     if not query:
-        return []
+        return None
 
     best_path = None
-    best_score = 0
+    best_overlap = 0.0
     for path, parts in index:
-        score = len(query & parts)
-        if score > best_score:
-            best_score = score
+        overlap = len(query & parts) / len(query)
+        if overlap > best_overlap:
+            best_overlap = overlap
             best_path = path
-    if not best_path or best_score == 0:
-        return []
+    if not best_path or best_overlap < 0.5:
+        return None
+
+    stem = os.path.splitext(os.path.basename(best_path))[0]
+    if version_tokens(stem) != version_tokens(title):
+        return None
 
     try:
         with open(best_path, encoding="utf-8", errors="replace") as f:
             lines = parse_lyrics(f.read())
     except OSError:
-        return []
-    if len(lines) >= 2:
-        log(f"Lyrics source: local ({best_path})")
-        return lines
-    return []
+        return None
+    if len(lines) < 2:
+        return None
+
+    match_score = int(300 * best_overlap)
+    return build_candidate("local", lines, match_score, best_path, length_ms)
 
 
 # --- NetEase Cloud Music ---
@@ -718,14 +832,14 @@ def netease_eapi_post(url, data):
         return json.loads(response.read().decode("utf-8"))
 
 
-def netease_search(query):
+def netease_search(query, limit=50, offset=0):
     result = netease_eapi_post(
         NETEASE_SEARCH_URL,
         {
             "s": query,
             "type": "1",
-            "limit": "20",
-            "offset": "0",
+            "limit": str(limit),
+            "offset": str(offset),
             "total": "true",
         },
     )
@@ -745,6 +859,197 @@ def netease_song_duration(song):
         return 0
 
 
+VERSION_CANON = {
+    "live": "live",
+    "现场": "live",
+    "现场版": "live",
+    "演唱会": "live",
+    "cover": "cover",
+    "翻唱": "cover",
+    "remix": "remix",
+    "混音": "remix",
+    "dj": "dj",
+    "dj版": "dj",
+    "instrumental": "instrumental",
+    "伴奏": "instrumental",
+    "伴奏版": "instrumental",
+    "纯音乐": "instrumental",
+    "钢琴": "instrumental",
+    "钢琴版": "instrumental",
+    "piano": "instrumental",
+    "女声": "female",
+    "女声版": "female",
+    "女生": "female",
+    "男声": "male",
+    "男声版": "male",
+    "男生": "male",
+    "说唱": "rap",
+    "说唱版": "rap",
+    "rap": "rap",
+    "抒情": "ballad",
+    "抒情版": "ballad",
+    "新版": "new",
+    "重制": "new",
+    "重制版": "new",
+    "acoustic": "acoustic",
+    "demo": "demo",
+    "karaoke": "karaoke",
+    "remaster": "remaster",
+    "remastered": "remaster",
+    "sped up": "spedup",
+    "spedup": "spedup",
+    "加速": "spedup",
+    "slowed": "slowed",
+    "降调": "slowed",
+    "升调": "pitchup",
+    "nightcore": "nightcore",
+    "片段": "clip",
+    "抖音": "douyin",
+}
+
+
+def _version_words_in(text):
+    text = text.lower()
+    found = set()
+    for word, canon in VERSION_CANON.items():
+        if word in text:
+            found.add(canon)
+    return found
+
+
+def _add_year(tokens, text):
+    match = re.search(r"(?:(?:19|20)\d{2})", text or "")
+    if match:
+        tokens.add(match.group(0))
+
+
+def version_tokens(text):
+    """Extract version markers such as live/remix/说唱版/2024."""
+    raw = unicodedata.normalize("NFKC", text or "").lower()
+    if not raw:
+        return set()
+
+    tokens = set()
+
+    for match in re.finditer(r"[\(\[]([^\)\]]+)[\)\]]", raw):
+        content = match.group(1)
+        tokens |= _version_words_in(content)
+        _add_year(tokens, content)
+
+    for match in re.finditer(r"[-–—]\s*([^-–—]+)$", raw):
+        content = match.group(1)
+        tokens |= _version_words_in(content)
+        _add_year(tokens, content)
+
+    match = re.search(r"([\u4e00-\u9fff]{1,6}版)\s*$", raw)
+    if match:
+        tokens |= _version_words_in(match.group(1))
+
+    _add_year(tokens, raw if re.search(r"(?:(?:19|20)\d{2})\s*$", raw) else "")
+
+    match = re.search(
+        r"\b(live|remix|cover|acoustic|demo|instrumental|karaoke|"
+        r"remaster(?:ed)?|sped\s*up|slowed|nightcore)\s*$",
+        raw,
+    )
+    if match:
+        tokens.add(match.group(1).replace(" ", ""))
+
+    return tokens
+
+
+def netease_song_titles(song):
+    titles = [song.get("name", "")]
+    for key in ("alia", "tns", "alias"):
+        value = song.get(key)
+        if isinstance(value, list):
+            titles.extend(str(item) for item in value if item)
+        elif isinstance(value, str) and value:
+            titles.append(value)
+    return [item for item in titles if item]
+
+
+def score_text_match(
+    query_title,
+    query_artist,
+    candidate_titles,
+    candidate_artists,
+    candidate_duration_ms,
+    query_length_ms,
+    raw_query_title,
+):
+    """
+    Shared title/artist/duration scorer used by every lyrics source.
+
+    Returns 0 when the candidate is not a safe match.
+    """
+    primary_title = candidate_titles[0] if candidate_titles else ""
+    if not primary_title:
+        return 0
+    if version_tokens(primary_title) != version_tokens(raw_query_title):
+        return 0
+
+    title_score = 0
+    for candidate in candidate_titles:
+        candidate_title = normalize(candidate)
+        if not candidate_title:
+            continue
+        if candidate_title == query_title:
+            title_score = max(title_score, 100)
+        elif query_title and (
+            query_title in candidate_title
+            or candidate_title in query_title
+        ):
+            title_score = max(title_score, 60)
+
+    # A different title must not be accepted just because the artist and
+    # duration are similar.
+    if title_score == 0:
+        return 0
+
+    artist_score = 0
+    for name in candidate_artists:
+        name = normalize(name)
+        if not name or not query_artist:
+            continue
+        if name == query_artist:
+            artist_score = max(artist_score, 100)
+        elif name in query_artist or query_artist in name:
+            artist_score = max(artist_score, 60)
+
+    duration_score = 0
+    if query_length_ms and candidate_duration_ms:
+        diff = abs(candidate_duration_ms - query_length_ms)
+        if diff <= 2000:
+            duration_score = 60
+        elif diff <= 5000:
+            duration_score = 30
+        elif diff <= 10000:
+            duration_score = 10
+        else:
+            duration_score = -60
+
+    # Require an artist match; this rejects same-title covers.
+    if query_artist:
+        if artist_score < 60:
+            return 0
+    else:
+        # Without artist metadata, only an exact title plus a close
+        # duration is safe enough.
+        if not (title_score == 100 and duration_score >= 30):
+            return 0
+
+    # A partial title match needs a strong artist or duration signal.
+    if title_score == 60 and artist_score < 100 and duration_score < 30:
+        return 0
+
+    score = title_score + artist_score + max(duration_score, 0)
+    min_score = 150 if query_artist else 120
+    if score < min_score:
+        return 0
+    return score
+
+
 def netease_pick_song(songs, artist, title, length_ms):
     query_title = normalize(title)
     query_artist = normalize(artist)
@@ -752,50 +1057,15 @@ def netease_pick_song(songs, artist, title, length_ms):
     best_score = 0
 
     for song in songs:
-        song_title = normalize(song.get("name", ""))
-        if not song_title:
-            continue
-
-        if song_title == query_title:
-            title_score = 100
-        elif query_title and (
-            query_title in song_title or song_title in query_title
-        ):
-            title_score = 60
-        else:
-            title_score = 0
-
-        artist_score = 0
-        for name in netease_song_artists(song):
-            name = normalize(name)
-            if not name or not query_artist:
-                continue
-            if name == query_artist:
-                artist_score = max(artist_score, 100)
-            elif name in query_artist or query_artist in name:
-                artist_score = max(artist_score, 60)
-
-        duration_score = 0
-        duration = netease_song_duration(song)
-        if length_ms and duration:
-            diff = abs(duration - length_ms)
-            if diff <= 2000:
-                duration_score = 60
-            elif diff <= 5000:
-                duration_score = 30
-            elif diff <= 10000:
-                duration_score = 10
-            else:
-                duration_score = -20
-
-        # If the scripts differ, a very close duration plus a matching
-        # artist is still a strong signal.
-        if title_score == 0 and not (
-            artist_score > 0 and duration_score >= 30
-        ):
-            continue
-
-        score = title_score + artist_score + max(duration_score, 0)
+        score = score_text_match(
+            query_title,
+            query_artist,
+            netease_song_titles(song),
+            netease_song_artists(song),
+            netease_song_duration(song),
+            length_ms,
+            title,
+        )
         if score > best_score:
             best = song
             best_score = score
@@ -824,23 +1094,33 @@ def netease_lyrics(song_id):
     return lrc, yrc
 
 
-def fetch_netease(artist, title, length_ms):
+def fetch_netease_candidate(artist, title, length_ms):
     query = f"{artist} {title}".strip()
     if not query:
-        return []
+        return None
 
     try:
-        songs = netease_search(query)
+        search_query = search_text(query)
+        songs = netease_search(search_query, limit=50, offset=0)
         if not songs and artist:
-            songs = netease_search(title)
+            search_query = search_text(title)
+            songs = netease_search(search_query, limit=50, offset=0)
         if not songs:
             log(f"NetEase: no search results for {query!r}")
-            return []
+            return None
 
         song, score = netease_pick_song(songs, artist, title, length_ms)
         if not song:
+            # The exact track is sometimes buried under many covers.
+            more = netease_search(search_query, limit=50, offset=50)
+            if more:
+                songs += more
+                song, score = netease_pick_song(
+                    songs, artist, title, length_ms
+                )
+        if not song:
             log(f"NetEase: no suitable match for {query!r}")
-            return []
+            return None
 
         lrc, yrc = netease_lyrics(song["id"])
         lines = parse_lyrics(lrc)
@@ -848,17 +1128,14 @@ def fetch_netease(artist, title, length_ms):
             lines = parse_yrc(yrc)
         if len(lines) < 2:
             log(f"NetEase: no synced lyrics for {song.get('name')!r}")
-            return []
+            return None
 
         names = " / ".join(netease_song_artists(song))
-        log(
-            f"Lyrics source: NetEase ({song.get('name')} - {names}, "
-            f"score={score})"
-        )
-        return lines
+        detail = f"{song.get('name')} - {names}"
+        return build_candidate("netease", lines, score, detail, length_ms)
     except Exception as e:
         log(f"NetEase error: {type(e).__name__}: {e}")
-        return []
+        return None
 
 
 # --- LRCLIB ---
@@ -879,53 +1156,123 @@ def parse_lrclib_track(track):
     return []
 
 
-def fetch_lrclib(artist, title):
+def score_lrclib_track(track, artist, title, length_ms):
+    duration_ms = 0
+    try:
+        duration_ms = int(float(track.get("duration") or 0) * 1000)
+    except (TypeError, ValueError):
+        duration_ms = 0
+
+    return score_text_match(
+        normalize(title),
+        normalize(artist),
+        [track.get("trackName", "")],
+        [track.get("artistName", "")],
+        duration_ms,
+        length_ms,
+        title,
+    )
+
+
+def add_lrclib_candidate(candidates, track, artist, title, length_ms):
+    score = score_lrclib_track(track, artist, title, length_ms)
+    if not score:
+        return
+    lines = parse_lrclib_track(track)
+    if len(lines) >= 2:
+        candidates.append((score, track, lines))
+
+
+def fetch_lrclib_candidate(artist, title, length_ms):
     if not title:
-        return []
+        return None
+
+    candidates = []
+    artist_query = unicodedata.normalize("NFKC", artist or "")
+    title_query = unicodedata.normalize("NFKC", title or "")
+
+    # The exact-match endpoint can fail independently (e.g. transient TLS
+    # errors). A failed get must not prevent the search fallback.
     try:
         params = urllib.parse.urlencode(
-            {"artist_name": artist, "track_name": title}
+            {"artist_name": artist_query, "track_name": title_query}
         )
-        try:
-            data = http_json(f"https://lrclib.net/api/get?{params}")
-            lines = parse_lrclib_track(data)
-            if len(lines) >= 2:
-                log("Lyrics source: LRCLIB")
-                return lines
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                raise
-
-        query = f"{artist} {title}".strip()
-        results = http_json(
-            "https://lrclib.net/api/search?"
-            + urllib.parse.urlencode({"q": query})
-        )
-        for track in results or []:
-            lines = parse_lrclib_track(track)
-            if len(lines) >= 2:
-                log("Lyrics source: LRCLIB (search)")
-                return lines
+        data = http_json(f"https://lrclib.net/api/get?{params}")
+        add_lrclib_candidate(candidates, data, artist, title, length_ms)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            log(f"LRCLIB get error: HTTP {e.code}")
     except Exception as e:
-        log(f"LRCLIB error: {type(e).__name__}: {e}")
-    return []
+        log(f"LRCLIB get error: {type(e).__name__}: {e}")
+
+    query = f"{artist_query} {title_query}".strip()
+    search_url = (
+        "https://lrclib.net/api/search?"
+        + urllib.parse.urlencode({"q": query})
+    )
+    for attempt in range(2):
+        try:
+            results = http_json(search_url)
+            for track in results or []:
+                add_lrclib_candidate(
+                    candidates, track, artist, title, length_ms
+                )
+            break
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            log(f"LRCLIB search error: {type(e).__name__}: {e}")
+
+    if not candidates:
+        return None
+
+    score, track, lines = max(candidates, key=lambda item: item[0])
+    detail = f"{track.get('trackName')} - {track.get('artistName')}"
+    return build_candidate("lrclib", lines, score, detail, length_ms)
 
 
 def fetch_lyrics(artist, title, length_ms, local_index):
     if not title:
         return []
+
+    candidates = []
     for source in LYRICS_SOURCES:
         if source == "local":
-            lines = find_local_lyrics(artist, title, local_index)
+            candidate = find_local_candidate(
+                artist, title, local_index, length_ms
+            )
         elif source == "netease":
-            lines = fetch_netease(artist, title, length_ms)
+            candidate = fetch_netease_candidate(artist, title, length_ms)
         elif source == "lrclib":
-            lines = fetch_lrclib(artist, title)
+            candidate = fetch_lrclib_candidate(artist, title, length_ms)
         else:
             continue
-        if len(lines) >= 2:
-            return lines
-    return []
+
+        if candidate:
+            candidates.append(candidate)
+            log(
+                f"Scoreboard: {source} match={candidate['match']} "
+                f"quality={candidate['quality']} total={candidate['total']} "
+                f"({candidate['detail']})"
+            )
+        else:
+            log(f"Scoreboard: {source} -> no candidate")
+
+    if not candidates:
+        log("Scoreboard: no acceptable lyrics")
+        return []
+
+    best = max(candidates, key=lambda item: item["total"])
+    log(
+        f"Scoreboard: selected {best['source']} "
+        f"total={best['total']} ({best['detail']})"
+    )
+    lines = apply_script_preference(best["lines"])
+
+    # Keep the previous lyric line through instrumental gaps instead of
+    # writing an empty line. The next non-empty line replaces it.
+    return [(timestamp, text) for timestamp, text in lines if text.strip()]
 
 
 def find_line_index(times, position_ms):
@@ -937,7 +1284,7 @@ def main():
     global is_playing, current_track_key, current_player
 
     if another_instance_running():
-        print("sptlrx-pipe: another instance is already running", flush=True)
+        print("mpris-lyrics-pipe: another instance is already running", flush=True)
         return
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
@@ -948,14 +1295,15 @@ def main():
 
     try:
         with open(LOG_PATH, "w") as f:
-            f.write(f"# sptlrx-pipe log - {datetime.now().isoformat()}\n")
+            f.write(f"# mpris-lyrics-pipe log - {datetime.now().isoformat()}\n")
     except OSError:
         pass
 
     write_lyrics("")
-    log("sptlrx-pipe started (local MPRIS)")
+    log("mpris-lyrics-pipe started (local MPRIS)")
     log(f"Lyrics sources: {', '.join(LYRICS_SOURCES)}")
     log(f"Lyrics offset: {LYRICS_OFFSET_MS:+d} ms")
+    log(f"Chinese script: {CHINESE_SCRIPT}")
 
     if not shutil.which("gdbus"):
         log("WARNING: gdbus not found; install glib2 (provides gdbus)")
@@ -972,14 +1320,12 @@ def main():
     lines = []
     line_times = []
     line_index = -2
+    current_title = ""
     position_base_ms = 0
     position_base_mono = time.monotonic()
     next_poll = 0.0
     known_buses = set()
     previous_playing = set()
-    intro_label = ""
-    intro_until = 0.0
-    absent_ticks = 0
 
     def current_position_ms():
         if not is_playing:
@@ -990,52 +1336,34 @@ def main():
 
     def show_current_line():
         nonlocal line_index
-        now = time.monotonic()
-
-        # Briefly show artist - title right after a track change.
-        if intro_label and now < intro_until:
-            set_output(intro_label)
-            return
-
         if not lines:
-            # No synced lyrics for this track (e.g. pure instrumental): ♪.
-            set_output("\u266b")
             return
-
         index = find_line_index(
             line_times, current_position_ms() + LYRICS_OFFSET_MS
         )
         if index == line_index:
             return
         line_index = index
-        if index < 0:
-            # Before the first verse: no lyric line yet.
+        if index >= 0:
+            set_output(lines[index][1])
+        elif current_title:
+            # Lyrics are available, but the first line has not started yet.
+            set_output(current_title)
+        else:
             set_output("\u266b")
-            return
-        text = lines[index][1]
-        if text:
-            set_output(text)
-        # Empty text == instrumental marker (间奏): keep the shown line,
-        # so the top bar never blanks out mid-song.
+
+    def show_playing_placeholder():
+        # During an intro or when no lyrics matched, show the song title.
+        set_output(current_title or "\u266b")
 
     while True:
         now = time.monotonic()
 
         if now >= next_poll:
             states = scan_players(whitelist)
-            buses_present = set(bus for bus, _ in states)
-
-            # Count how long the current non-browser player has been absent
-            # from detection. A transient D-Bus hiccup or a failed state read
-            # shouldn't let a browser steal control, but a genuinely closed
-            # player is eventually dropped after the grace period.
-            if current_player and current_player not in buses_present:
-                absent_ticks += 1
-            else:
-                absent_ticks = 0
-
-            if buses_present != known_buses:
-                known_buses = buses_present
+            buses = set(bus for bus, _ in states)
+            if buses != known_buses:
+                known_buses = buses
                 if states:
                     summary = ", ".join(
                         f"{player_suffix(bus)}={state.get('status')}"
@@ -1054,23 +1382,12 @@ def main():
             previous_playing = playing_now
 
             chosen = choose_player(states, current_player, newly_playing)
-
-            # Hold onto a music player across brief detection gaps so a
-            # transient D-Bus hiccup doesn't blank the bar; only after it
-            # has been absent for several polls do we give it up.
-            if current_player and not is_browser_player(current_player):
-                if absent_ticks >= MPRIS_ABSENT_GRACE:
-                    chosen = choose_player(
-                        states, None, newly_playing
-                    )
-                elif not chosen:
-                    chosen = current_player
-
             by_bus = dict(states)
 
             if chosen != current_player:
                 current_player = chosen
                 current_track_key = None
+                current_title = ""
                 lines = []
                 line_times = []
                 line_index = -2
@@ -1086,6 +1403,7 @@ def main():
 
             if not chosen:
                 is_playing = False
+                current_title = ""
                 line_index = -2
                 set_output("\u23f9 No player")
             else:
@@ -1096,6 +1414,7 @@ def main():
                 status = state.get("status")
                 if status is None:
                     is_playing = False
+                    current_title = ""
                     line_index = -2
                     set_output("")
                 else:
@@ -1104,6 +1423,9 @@ def main():
 
                     if track_key != current_track_key:
                         current_track_key = track_key
+                        current_title = apply_script_text(
+                            state.get("title") or ""
+                        )
                         lines = []
                         line_times = []
                         line_index = -2
@@ -1112,21 +1434,28 @@ def main():
 
                         if state.get("title"):
                             log(f"Track changed: {state.get('label')}")
-                            # Briefly show artist - title before lyrics.
                             if status == "Playing":
-                                intro_label = state.get("label")
-                                intro_until = (
-                                    time.monotonic()
-                                    + TRACK_CHANGE_INTRO_SECONDS
+                                show_playing_placeholder()
+                            lines = fetch_lyrics(
+                                state.get("artist", ""),
+                                state.get("title", ""),
+                                state.get("length_ms"),
+                                local_index,
+                            )
+                            line_times = [item[0] for item in lines]
+                            if lines:
+                                index = find_line_index(
+                                    line_times,
+                                    position_base_ms + LYRICS_OFFSET_MS,
                                 )
-
-                        lines = fetch_lyrics(
-                            state.get("artist", ""),
-                            state.get("title", ""),
-                            state.get("length_ms"),
-                            local_index,
-                        )
-                        line_times = [item[0] for item in lines]
+                                line_index = index
+                                if status == "Playing":
+                                    if index >= 0:
+                                        set_output(lines[index][1])
+                                    else:
+                                        show_playing_placeholder()
+                            elif status == "Playing":
+                                show_playing_placeholder()
                     else:
                         if state.get("position_ms") is not None:
                             position_base_ms = state["position_ms"]
@@ -1135,7 +1464,10 @@ def main():
                     if status == "Playing":
                         if not was_playing:
                             log(f"Playing: {state.get('label')}")
-                            show_current_line()
+                            if lines:
+                                show_current_line()
+                            else:
+                                show_playing_placeholder()
                         is_playing = True
                     else:
                         is_playing = False
@@ -1149,7 +1481,7 @@ def main():
 
             next_poll = now + POLL_INTERVAL
 
-        if is_playing:
+        if is_playing and lines:
             show_current_line()
 
         time.sleep(TICK_INTERVAL)
