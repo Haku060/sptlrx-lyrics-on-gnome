@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.mpris-lyrics"
+          path="/org/gnome/shell/extensions/mpris-lyrics/">
+    <key name="refresh-interval-ms" type="i">
+      <default>100</default>
+      <range min="50" max="2000"/>
+      <summary>Refresh interval</summary>
+      <description>How often the lyrics file is read, in milliseconds.</description>
+    </key>
+    <key name="max-length" type="i">
+      <default>75</default>
+      <range min="10" max="500"/>
+      <summary>Maximum text length</summary>
+      <description>Maximum number of characters shown in the top panel.</description>
+    </key>
+    <key name="panel-position" type="s">
+      <default>'left'</default>
+      <choices>
+        <choice value="left"/>
+        <choice value="center"/>
+        <choice value="right"/>
+      </choices>
+      <summary>Panel position</summary>
+      <description>Which part of the GNOME top panel to place the lyrics in.</description>
+    </key>
+    <key name="panel-index" type="i">
+      <default>1</default>
+      <range min="0" max="20"/>
+      <summary>Panel order</summary>
+      <description>Position among the items in the selected panel section.</description>
+    </key>
+    <key name="hide-when-empty" type="b">
+      <default>true</default>
+      <summary>Hide when empty</summary>
+      <description>Hide the panel label when there is no lyric text.</description>
+    </key>
+    <key name="show-status" type="b">
+      <default>true</default>
+      <summary>Show playback status</summary>
+      <description>Show paused/stopped status in the panel.</description>
+    </key>
+    <key name="font-size" type="i">
+      <default>0</default>
+      <range min="0" max="48"/>
+      <summary>Font size</summary>
+      <description>Label font size in pixels. 0 uses the panel default.</description>
+    </key>
+    <key name="text-color" type="s">
+      <default>''</default>
+      <summary>Text color</summary>
+      <description>Optional CSS color for the lyrics label, e.g. #ffcc00.</description>
+    </key>
+    <key name="prefix-icon" type="b">
+      <default>false</default>
+      <summary>Always show music icon</summary>
+      <description>Show the music icon before the song title and lyric lines.</description>
+    </key>
+  </schema>
+</schemalist>

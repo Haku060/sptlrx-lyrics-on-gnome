@@ -15,7 +15,7 @@ This project uses or derives from the following open-source resources:
 - Project: https://github.com/WXRIW/Lyricify-Lyrics-Helper
 - License: Apache License 2.0
 - Purpose: the online lyrics eapi request format (search and lyric
-  endpoints) in `sptlrx-pipe` was implemented by referencing Lyricify's
+  endpoints) in `mpris-lyrics-pipe` was implemented by referencing Lyricify's
   public open-source implementation.
 
 ## LRCLIB

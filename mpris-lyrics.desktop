@@ -2,7 +2,7 @@
 Type=Application
 Name=MPRIS Lyrics Pipe
 Comment=Write local MPRIS lyrics to a file for the GNOME top bar
-Exec=/home/haku/.local/bin/sptlrx-pipe /tmp/sptlrx-lyrics
+Exec=/home/haku/.local/bin/mpris-lyrics-pipe /tmp/mpris-lyrics
 Icon=audio-x-generic
 Terminal=false
 Categories=Utility;
